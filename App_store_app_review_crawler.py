@@ -1,60 +1,86 @@
-import pandas as pd
-from app_store_scraper import AppStore
+"""Collect a bounded batch of recent public App Store reviews."""
+
+import argparse
+import json
+from datetime import date, datetime
+from pathlib import Path
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+
+from review_output import safe_name, save_reviews
 
 
-# 앱스토어 크롤링 정의
-def App_store_crawler(app_name : str = None, app_id : int = None, user_defined_app_name: str = None, output_file="app_reviews.csv"):
+def fetch_json(url):
+    request = Request(url, headers={"User-Agent": "app-review-crawler/1.0"})
+    with urlopen(request, timeout=15) as response:
+        return json.load(response)
 
 
-    # 앱 이름 or id 입력 시 조건
-    if not app_name and not app_id :
-        print("앱 이름이나 ID 중 하나는 반드시 입력해야 합니다.")
-        return
-    
-    # 출력할 앱 이름 설정 (사용자가 지정한 이름이 있으면 우선 사용)
-    display_name = user_defined_app_name if user_defined_app_name else app_name if app_name else str(app_id)
-    print(f"{display_name}의 리뷰를 가져오는 중...")
-
-    # 앱스토어 크롤링
-    app = AppStore(country='kr', app_name = app_name, app_id = app_id)
-    app.review()
-
-    # 데이터 정리
-    app_reviews = pd.DataFrame(app.reviews)
-    if not app_reviews.empty:
-        app_reviews = app_reviews.sort_values('date', ascending=False).reset_index(drop=True)
-
-    if user_defined_app_name:
-        app_reviews['app_name'] = user_defined_app_name
+def lookup_app_id(name, fetch=fetch_json):
+    url = "https://itunes.apple.com/search?" + urlencode({
+        "term": name, "country": "kr", "entity": "software", "limit": 20,
+    })
+    matches = [item for item in fetch(url).get("results", [])
+               if item.get("trackName", "").casefold() == name.casefold()]
+    if len(matches) != 1:
+        raise ValueError("앱 이름을 하나로 특정할 수 없습니다. App Store의 숫자 --app-id를 입력하세요.")
+    return int(matches[0]["trackId"])
 
 
-    #csv 형식으로 저장
-    app_reviews.to_csv(output_file, index=False, encoding='utf-8-sig')
-    print(f"리뷰 데이터가 '{output_file}'파일로 저장되었습니다.총{len(app_reviews)}건")
-    
-    return app_reviews
+def collect(app_name=None, app_id=None, limit=200, after=None, fetch=fetch_json):
+    if not app_name and not app_id:
+        raise ValueError("app_name or app_id is required")
+    if limit < 1:
+        raise ValueError("limit must be positive")
+    app_id = app_id or lookup_app_id(app_name, fetch)
+    rows, seen = [], set()
+    for page in range(1, 11):  # The public RSS feed exposes at most ten pages.
+        url = f"https://itunes.apple.com/kr/rss/customerreviews/id={app_id}/page={page}/sortBy=mostRecent/json"
+        entries = fetch(url).get("feed", {}).get("entry", [])
+        if not entries:
+            break
+        reached_cutoff = False
+        for item in entries:
+            if "im:rating" not in item:
+                continue
+            reviewed_at = datetime.fromisoformat(item["updated"]["label"])
+            if after and reviewed_at.date() < after:
+                reached_cutoff = True
+                break
+            review_id = item["id"]["label"]
+            if review_id in seen:
+                continue
+            seen.add(review_id)
+            rows.append({
+                "store": "app_store", "app_id": app_id,
+                "review_id": review_id, "review": item.get("content", {}).get("label", ""),
+                "score": item["im:rating"]["label"], "review_date": reviewed_at,
+                "app_version": item.get("im:version", {}).get("label", ""),
+                "thumbs_up_count": item.get("im:voteSum", {}).get("label", ""),
+                "title": item.get("title", {}).get("label", ""),
+            })
+            if len(rows) >= limit:
+                return rows
+        if reached_cutoff:
+            break
+    return rows
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--app-name", help="Exact App Store name")
+    parser.add_argument("--app-id", type=int, help="Numeric App Store ID (recommended)")
+    parser.add_argument("--limit", type=int, default=200, help="Maximum reviews per run (default: 200)")
+    parser.add_argument("--after", type=date.fromisoformat, help="Include reviews from YYYY-MM-DD")
+    parser.add_argument("--output", type=Path)
+    args = parser.parse_args()
+    if not args.app_name and not args.app_id:
+        parser.error("--app-name or --app-id is required")
+    output = args.output or Path(f"app_store_{safe_name(str(args.app_id or args.app_name))}_reviews.csv")
+    rows = collect(args.app_name, args.app_id, args.limit, args.after)
+    save_reviews(output, rows)
+    print(f"Saved {len(rows)} reviews to {output}")
 
 
 if __name__ == "__main__":
-    
-    #사용자 입력 받기
-    app_name = input("앱 이름을 입력해주세요.(없으면 enter)").strip() or None # 해당 입력은 옵션
-    app_id_input = input("앱 id를 입력해주세요.(없으면 enter)").strip() # 해당 입력은 옵션
-    user_defined_app_name = input("저장할 앱 이름을 입력해주세요(없으면 enter)").strip() # 해당 입력도 옵션
-
-    # 입력값 처리
-    app_id = int(app_id_input) if app_id_input.isdigit() else None
-
-    # 파일명 정의
-    display_name = user_defined_app_name if user_defined_app_name else app_name if app_name else str(app_id)
-    output_file_name = f"AppStore_{display_name}_reviews.csv"
-
-    # 앱 이름 또는 앱 ID가 입력되었는지 확인 후 크롤링 실행
-    if app_name or app_id :
-        App_store_crawler(app_name, app_id, user_defined_app_name, output_file_name)
-
-    else :
-        print("앱 이름이나 id를 입력해야 합니다.")
-
-
-# 자세한 내용은 여기 참조 https://pypi.org/project/app-store-scraper/
+    main()
