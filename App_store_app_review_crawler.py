@@ -20,7 +20,9 @@ def App_store_crawler(app_name : str = None, app_id : int = None, user_defined_a
     app.review()
 
     # 데이터 정리
-    app_reviews = pd.DataFrame(app.reviews).sort_values('date', ascending=False).reset_index(drop=True)
+    app_reviews = pd.DataFrame(app.reviews)
+    if not app_reviews.empty:
+        app_reviews = app_reviews.sort_values('date', ascending=False).reset_index(drop=True)
 
     if user_defined_app_name:
         app_reviews['app_name'] = user_defined_app_name
